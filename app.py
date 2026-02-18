@@ -15,6 +15,7 @@ from decimal import Decimal
 from datetime import date, datetime
 from functools import wraps
 from flask import Flask, request, jsonify
+from flask_cors import CORS
 from dotenv import load_dotenv
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -44,6 +45,8 @@ redis_client = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 IA_URL = "https://mycoach-2.tksol.com.br/v1/chat/completions"
 MODEL_NAME = "llama-4-maverick"
 IA_TIMEOUT = 45
+
+CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Configurações de Banco de Dados (Connection Pool)
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -206,7 +209,7 @@ def classify_intent(user_msg):
     except:
         return True # Fallback seguro
 
-def execute_sql_with_autocorrect(conn, initial_sql, user_msg, system_prompt_base):
+def execute_sql_with_autocorrect(conn, initial_sql, user_msg, system_prompt_base, tenant_id, is_admin):
     """
     Tenta executar o SQL. Se der erro no Postgres, devolve o erro para a IA
     e pede uma correção (máximo de 2 tentativas de correção).
@@ -258,12 +261,132 @@ def execute_sql_with_autocorrect(conn, initial_sql, user_msg, system_prompt_base
             current_sql = clean_sql(fixed_sql_raw)
 
             # Validação de segurança novamente (vai que a IA alucina um DROP na correção)
-            if not is_safe_sql(current_sql):
+            if not is_safe_sql(current_sql, tenant_id, is_admin):
                 logger.warning("⛔ Correção gerou SQL inseguro. Abortando.")
                 break
 
     # Se saiu do loop, falhou
     raise last_error
+
+def analyze_context_relevance(user_msg, context):
+    """
+    Decide o destino da conversa: Refinamento (True) ou Nova Busca (False).
+    Usa análise léxica (Python) + análise semântica (IA).
+    """
+    if not context:
+        return False
+
+    msg = user_msg.lower().strip()
+
+    reset_triggers = [
+        # Comandos Explícitos
+        "nova busca", "novo filtro", "limpar", "limpar filtro", "esquece", 
+        "começar de novo", "do zero", "resetar", "apagar",
+        
+        # Verbos de Ação (Geralmente iniciam frases de busca)
+        "listar", "lista", "listagem", 
+        "buscar", "busque", "procurar", "procure", 
+        "pesquisar", "pesquise", "encontrar", "encontre",
+        "traz", "traga", "mostre todos", "mostrar todos",
+        "quem é", "quem são", "quais são", # Ex: "Quem é o aluno X?" (Geralmente é busca direta)
+        
+        # Mudança de Sujeito / Intenção
+        "agora quero", "agora busca", "muda para", "troca para",
+        "quero ver", "gostaria de saber", "preciso saber",
+        
+        # Generalizações (Quebram filtros específicos anteriores)
+        "todos os", "todas as", "tudo", "geral", "banco todo"
+    ]
+
+    continuation_triggers = [
+        # Pronomes (A chave principal)
+        "dele", "dela", "deles", "delas", "ele", "ela", "eles", "elas",
+        "desse", "dessa", "desses", "dessas",
+        "este", "esta", "estes", "estas",
+        "ele", "ela", "eles", "elas",
+        "o mesmo", "a mesma",
+        
+        # Conectivos Aditivos
+        "e o", "e a", "e os", "e as", # Ex: "E o telefone?"
+        "também", "alem disso", "incluindo", "com", "sem",
+        
+        # Pedidos de Detalhes (Colunas comuns)
+        "telefone", "celular", "email", "e-mail", "endereço", "cpf", 
+        "data", "nascimento", "idade", "nome completo", "status",
+        "nota", "pontuação", "resultado",
+        
+        # Filtros e Ordenação
+        "filtre", "filtra", "filtrar",
+        "ordene", "ordena", "ordenar", "classifique",
+        "agrupe", "agrupa",
+        "apenas", "somente", "só os", "só as", "tire", "remova",
+        "mais recente", "mais antigo", "maior", "menor", "melhor", "pior",
+        "primeiro", "último",
+        
+        # Agregações / Quantidade (Onde você teve erro antes)
+        "quantos", "quantas", "qual o total", "total", 
+        "contagem", "são quantos", "numero de", "quantidade",
+        "resuma", "resumo", "media"
+    ]
+    
+    # 1. VERIFICAÇÃO DE RESET (Prioridade Alta)
+    # Se o usuário mandou "Listar todos", não importa se tem "dele" no meio, é reset.
+    if any(msg.startswith(t) for t in reset_triggers):
+        logger.info(f"🧹 Contexto RESETADO por gatilho de início: '{user_msg}'")
+        return False
+        
+    # Verificação de reset no meio da frase (menos rígida)
+    # Ex: "Não, agora busca por X"
+    if any(f" {t} " in f" {msg} " for t in ["nova busca", "esquece", "do zero", "listar todos"]):
+        logger.info(f"🧹 Contexto RESETADO por gatilho interno: '{user_msg}'")
+        return False
+
+    # 2. VERIFICAÇÃO DE CONTINUAÇÃO (Economia de Token)
+    # Se a frase for curta (< 15 palavras) e tiver gatilho claro, aprova direto.
+    is_short = len(msg.split()) < 15
+    has_continuation = any(t in msg for t in continuation_triggers)
+    
+    if is_short and has_continuation:
+        logger.info(f"⚡ Contexto MANTIDO por gatilho rápido: '{user_msg}'")
+        return True
+
+    # 3. ANÁLISE SEMÂNTICA (IA) - O Desempate
+    # Se não caiu em nenhum gatilho óbvio, a IA decide.
+    last_msg = context.get('last_message', '')
+    last_sql = context.get('last_sql', '')
+
+    prompt = f"""
+    Classifique a intenção para SQL.
+    
+    [HISTÓRICO]
+    Busca Anterior: "{last_msg}"
+    SQL Anterior: {last_sql}
+    
+    [NOVA PERGUNTA]
+    User: "{user_msg}"
+    
+    [REGRA]
+    Responda JSON {{"is_related": true}} SE:
+    - É um detalhamento ("e o telefone?", "qual o cpf?").
+    - É um filtro sobre o resultado ATUAL ("só os aprovados", "quem tirou zero").
+    - É uma agregação ("quantos são?", "qual a média?").
+    
+    Responda JSON {{"is_related": false}} SE:
+    - Muda o foco principal (ex: estava vendo 'alunos', agora pede 'financeiro').
+    - Muda o sujeito da busca (ex: buscou 'João', agora pede 'Maria').
+    - Parece uma nova consulta independente.
+    
+    Na dúvida, FALSE (Melhor pecar por segurança e fazer nova busca).
+    """
+
+    response = call_ai_service([{"role": "system", "content": prompt}], temperature=0.0)
+    
+    try:
+        clean_resp = response.replace("```json", "").replace("```", "").strip()
+        data = json.loads(clean_resp)
+        return data.get("is_related", False)
+    except:
+        return False
 
 # ==============================================================================
 # 3. GESTÃO DE ESTADO (REDIS)
@@ -337,14 +460,37 @@ def get_system_prompt(user_id, tenant_id, is_admin, limit_value, previous_sql=No
     context_instruction = ""
     if previous_sql:
         context_instruction = f"""
-        [REFINAMENTO]
-        Usuário está refinando consulta anterior.
-        SQL anterior válido:
+        [MODO DE REFINAMENTO ATIVO]
+        O usuário está fazendo uma pergunta SOBRE o resultado desta query anterior:
         ```sql
         {previous_sql}
-    Adapte essa query (mantenha JOINs existentes).
-    Se o usuário citar nome errado (ex: "Pociano"), corrija para nome real dos resultados anteriores (fornecidos no histórico).
-    """
+        ```
+        
+        Use apenas dados fornecidos.
+        Se uma informação não estiver no JSON de Dados, diga apenas que ela não foi carregada nesta consulta, 
+        NÃO diga que ela "Não consta" no sistema, a menos que o valor seja explicitamente "Não informado".
+
+        [REGRA ABSOLUTA DE CONTINUAÇÃO]
+        1. COPIE O 'FROM' E O 'WHERE' DA QUERY ANTERIOR INTEGRALMENTE.
+        2. APENAS ALTERE O 'SELECT' PARA RESPONDER A NOVA PERGUNTA.
+        3. NÃO REMOVA FILTROS DE DATA (ex: 'CURRENT_DATE') OU STATUS.
+        
+        [EXEMPLOS DE COMO AGIR]
+        Exemplo 1:
+        Query Anterior: SELECT count(*) FROM auth_user u WHERE u.date_joined::date = CURRENT_DATE
+        Usuário: "Quais são os nomes?"
+        Sua Resposta: SELECT u.first_name, u.last_name FROM auth_user u WHERE u.date_joined::date = CURRENT_DATE
+        (Note que o WHERE permaneceu idêntico)
+
+        Exemplo 2:
+        Query Anterior: SELECT * FROM seletivo_exam e WHERE e.score > 50
+        Usuário: "Qual a maior nota?"
+        Sua Resposta: SELECT e.score FROM seletivo_exam e WHERE e.score > 50 ORDER BY e.score DESC LIMIT 1
+
+        Adapte essa query (mantenha JOINs existentes).
+        Se o usuário citar nome errado (ex: "Pociano"), corrija para nome real dos resultados anteriores (fornecidos no histórico).
+        """
+
     return f"""
     Você é um gerador especialista de SQL PostgreSQL 16.
     Responda APENAS com o código SQL SELECT válido. Nada mais.
@@ -366,6 +512,13 @@ def get_system_prompt(user_id, tenant_id, is_admin, limit_value, previous_sql=No
     - Hoje é: {datetime.now().strftime('%Y-%m-%d')}
     - Se o usuário pedir 'hoje', use: WHERE u.date_joined::date = CURRENT_DATE
     - Nunca assuma que o usuário está falando de resultados anteriores se ele citar datas específicas.
+
+    [REGRA DE OURO PARA FILTROS]
+    1. Se o usuário fornecer um NOVO critério de busca (ex: um nome específico, um CPF, um email), este critério tem PRIORIDADE.
+    2. Se o critério novo for incompatível com o filtro de data anterior (ex: perguntou de 'ontem' antes, mas agora deu um nome específico), REMOVA o filtro de data anterior para encontrar o registro.
+    3. Se o usuário apenas pedir um detalhe extra (ex: 'e o CPF?') sem dar um nome novo, mantenha o WHERE anterior.
+
+    Regra: Se a nova pergunta usar pronomes (dele, dela, qual o CPF, qual o email e etc), você DEVE manter o WHERE da query anterior exatamente como está. Altere apenas as colunas do SELECT.
 
     [SCHEMA - USE ESTES ALIASES E JOINS EXATOS]
 
@@ -422,47 +575,30 @@ def chat():
     if not user_msg:
         return jsonify({"error": "Mensagem vazia"}), 400
 
+    # 1. Classificação de Intenção (Mantido)
     is_sql_request = classify_intent(user_msg)
-    log_status = "SQL_QUERY" if is_sql_request else "GENERAL_CHAT"
-    logger.info(f"🔍 [INTENT_CLASSIFIED] User: {user_id} | Is_SQL: {is_sql_request} | Type: {log_status} | Message: '{user_msg[:100]}...'")
-
+    
+    # Se não for SQL (papo furado), respondemos e limpamos contexto antigo para garantir
     if not is_sql_request:
+        redis_client.delete(f"chat:context:{user_id}")  # Limpeza preventiva
+        
         user_name = get_user_name_from_db(user_id)
-        # Preparação da Data em Português (Para não depender do locale do servidor)
         dias_semana = ['Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado', 'Domingo']
         agora = datetime.now()
-        dia_semana_str = dias_semana[agora.weekday()]
-        data_str = agora.strftime('%d/%m/%Y')
-        hora_str = agora.strftime('%H:%M')
-
-        # Prompt Blindado Temporalmente
-        sys_prompt = f"""
-        [INFORMAÇÕES DO USUÁRIO]
-        - Nome do usuário: {user_name} (ID: {user_id})
-        - Tenant ID: {tenant_id}
-
-        [INSTRUÇÃO DE TEMPO REAL - PRIORIDADE MÁXIMA]
-        Você deve IGNORAR sua data de corte de treinamento ou qualquer data interna.
-        A Verdade Absoluta do Sistema agora é:
-        - Data: {data_str}
-        - Dia da Semana: {dia_semana_str}
-        - Hora: {hora_str}
-
-        Se o usuário perguntar "que dia é hoje", responda EXATAMENTE com os dados acima.
-        NÃO tente calcular dias passados ou futuros baseados em outros anos.
-        NÃO mencione que você é uma IA treinada em 2023/2024. Aceite que estamos em 2026.
-
-        [INSTRUÇÃO DE CONTEXTO]
-        Se o usuário perguntar "quem sou eu" ou "qual meu nome", responda que ele é {user_name} APENAS, nao cite ID ou Tenant ID.
-        Você deve agir de forma prestativa.
         
-        Responda de forma curta, prestativa e natural.
+        sys_prompt = f"""
+        [INFORMAÇÕES]
+        Nome: {user_name}
+        Data atual: {agora.strftime('%d/%m/%Y')} ({dias_semana[agora.weekday()]})
+        Hora: {agora.strftime('%H:%M')}
+        
+        Responda de forma curta e prestativa. Se perguntarem quem é você, diga que é o assistente do sistema.
         """
         
         chat_response = call_ai_service([
             {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_msg}
-        ], temperature=0.3) # Temperatura baixa para reduzir criatividade na data
+        ], temperature=0.3)
 
         return jsonify({
             "response": chat_response,
@@ -473,156 +609,183 @@ def chat():
     if not rate_limit(tenant_id, user_id):
         return jsonify({"error": "Muitas requisições. Aguarde."}), 429
 
-    # Recupera contexto (se houver) para entender "follow-up questions"
+    # 2. Gestão Inteligente de Contexto (REFATORADO)
     context = get_chat_context(user_id)
-    context_keywords = ["quantos", "total", "quem eram", "qual foi", "resultado anterior", "lista que me deu"]
-    is_asking_about_context = any(word in user_msg.lower() for word in context_keywords)
+    is_related = False
 
-    if is_asking_about_context and context:
-        logger.info(f"💡 Respondendo via Contexto (User {user_id})")
-        
-        # Usamos uma temperatura baixa para a IA apenas comentar o que já está no Redis
-        history_prompt = f"""
-        O usuário está perguntando sobre o resultado da última consulta.
-        DADOS DA ÚLTIMA CONSULTA:
-        - Pergunta anterior: "{context.get('last_message')}"
-        - Total encontrado no banco: {context.get('row_count')}
-        - Amostra dos dados: {json.dumps(context.get('preview'), ensure_ascii=False)}
+    # Só analisamos relevância se houver contexto anterior
+    if context:
+        is_related = analyze_context_relevance(user_msg, context)
+        if is_related:
+            logger.info(f"🔗 Contexto Relacionado Detectado (User {user_id})")
+        else:
+            logger.info(f"🧹 Mudança de assunto detectada. Limpando contexto anterior (User {user_id})")
+            context = None  # Anula a variável local para não ser usada no prompt
 
-        Pergunta atual do usuário: "{user_msg}"
-
-        Responda de forma natural e direta baseando-se APENAS nos dados acima.
-        Se ele perguntar 'quantos', diga o número total.
-        """
-        
-        context_response = call_ai_service([{"role": "system", "content": history_prompt}], temperature=0.2)
-        
-        return jsonify({
-            "response": context_response,
-            "data": context.get("preview"),
-            "meta": {
-                "total": context.get("row_count"),
-                "source": "cache_context"
-            }
-        })
-
-    # Lógica de conexão segura
+    # 3. Bloco de Resposta Rápida via Contexto (Opcional - Economia de SQL)
+    # Se a IA diz que é relacionado E a pergunta não parece exigir nova busca complexa
+    # Podemos tentar responder direto com os dados cacheados (ex: "quem é o primeiro da lista?")
+    # Porém, para garantir consistência, vamos focar em passar o contexto para o SQL generator.
+    
     conn = get_db_connection()
     try:
         is_admin = get_user_is_admin(user_id)
         limit_val = 50 if is_admin else 20
-        previous_sql = context.get("last_sql") if context else None
+        
+        # Se 'is_related' for False, previous_sql será None, impedindo alucinação
+        previous_sql = context.get("last_sql") if (context and is_related) else None
 
         prompt = get_system_prompt(user_id, tenant_id, is_admin, limit_val, previous_sql)
-        
         messages = [{"role": "system", "content": prompt}]
-        if context and previous_sql:
-            # Pegamos os dados do contexto
-            prev_data_str = json.dumps(context.get('preview', []), ensure_ascii=False)
-            
-            # Injetamos como uma memória do assistente ou user
-            messages.append({
+
+        # Injeção de Contexto BLINDADA
+        if context and is_related:
+             messages.append({
                 "role": "user", 
                 "content": f"""
-                Resultado da minha busca anterior ({context['row_count']} registros encontrados). 
-                Aqui estão os dados que você retornou:
-                {prev_data_str}
-                
-                Query que gerou isso: {context['last_sql']}
+                [COMANDO DE REFINAMENTO]
+                Query Base (Anterior): `{context.get('last_sql')}`
+                Nova Pergunta: "{user_msg}"
+
+                Instrução: Esta pergunta refere-se ao resultado da busca anterior. 
+                NÃO remova os filtros de data ou de ID do SQL anterior. 
+                Apenas adicione os campos solicitados ao SELECT.
+
+
+                [DIRETRIZES DE FUSÃO]
+                1. Você deve refinar a Query Anterior com a Nova Intenção.
+                2. SE a nova intenção CONFLITAR com um filtro antigo (ex: mudou de nome 'Gabriel' para 'Douglas'), SUBSTITUA o filtro antigo pelo novo.
+                3. SE for apenas um pedido de detalhe (ex: "e o email?"), MANTENHA todos os filtros (WHERE) e adicione a coluna no SELECT.
+
+                [INSTRUÇÃO TÉCNICA]
+                Se o usuário citar um NOME ou IDENTIFICADOR na nova pergunta, considere que ele quer buscar essa pessoa em TODO o banco. 
+                Nesse caso, desconsidere filtros de DATA (como CURRENT_DATE ou ONTEM) da query anterior para não restringir o resultado indevidamente.
                 """
             })
         
         messages.append({"role": "user", "content": user_msg})
 
-        if len(json.dumps(messages)) > 8000:  # estimativa grosseira de bytes ≈ tokens
-            # Versão ultra-slim sem preview completo
-            messages = [{"role": "system", "content": prompt},
-                        {"role": "user", "content": user_msg}]
-
+        # Geração do SQL
         raw_sql = call_ai_service(messages)
         if not raw_sql:
             return jsonify({"response": "Serviço de IA indisponível temporariamente."}), 503
 
         sql = clean_sql(raw_sql)
-        logger.info(f"SQL Gerado Inicial (User {user_id}): {sql}")
+        logger.info(f"SQL Gerado (User {user_id}): {sql}, Pergunta: {user_msg}")
 
         if not is_safe_sql(sql, tenant_id, is_admin):
-            logger.warning(f"SQL Bloqueado: {sql}")
-            return jsonify({"response": "Não posso executar essa consulta por motivos de segurança."})
+            return jsonify({"response": "Consulta não permitida por segurança."})
 
+        # Execução com Cache e Auto-correção
         sql_hash = hashlib.sha256(sql.encode()).hexdigest()
         cache_key_sql = f"sql:cache:{tenant_id}:{sql_hash}"
         cached_rows = redis_client.get(cache_key_sql)
 
         if cached_rows:
-            logger.info("CACHE HIT")
             rows = json.loads(cached_rows)
             final_sql = sql
         else:
-            logger.info("CACHE MISS - Iniciando Execução com Retry")
-            # CAMADA 3: AUTO-CORREÇÃO DE ERRO SQL
             try:
-                # Chama a função blindada que tenta corrigir o SQL se der erro
-                rows, final_sql = execute_sql_with_autocorrect(conn, sql, user_msg, prompt)
-                
-                # Se passou, salva no cache
+                rows, final_sql = execute_sql_with_autocorrect(conn, sql, user_msg, prompt, tenant_id, is_admin)
                 redis_client.setex(cache_key_sql, 60, json.dumps(rows, ensure_ascii=False))
-
             except psycopg2.Error as e:
-                # Se falhou após todos os retries
                 return jsonify({
-                    "response": "Encontrei uma dificuldade técnica ao cruzar esses dados. Tente simplificar a pergunta.",
+                    "response": "Não consegui cruzar esses dados corretamente. Tente ser mais específico.",
                     "debug_error": str(e)
                 })
 
-        # Atualiza o contexto com o SQL FINAL (pode ser diferente do inicial se houve correção)
+        # Atualiza o contexto SEMPRE com a nova interação válida
         set_chat_context(user_id, user_msg, final_sql, rows)
 
         if not rows:
-            return jsonify({"response": "Não encontrei nenhum registro para sua busca.", "data": []})
+            return jsonify({"response": "Nenhum dado encontrado para sua busca.", "data": []})
 
+        # Sumarização final
         data_preview = rows[:10]
         total = len(rows)
 
-        summary_prompt = f"""
-        Atue como um assistente de dados objetivo e responda de forma clara, concisa e amigável.
+        is_single_value = False
+        single_val = None
         
-        CONTEXTO:
-        O usuário perguntou: "{user_msg}"
-        O banco retornou: {total} registros no total.
-        Abaixo estão os dados (limitados para visualização):
-        {json.dumps(data_preview, ensure_ascii=False)}
-        Evite jargões técnicos (ex.: Encontramos ... no banco de dados | De acordo com as colunas no banco de dados...).
+        if len(rows) == 1 and len(rows[0]) == 1:
+            is_single_value = True
+            # Pega o primeiro valor do dicionário, ignorando a chave (seja 'count', 'max', etc)
+            single_val = list(rows[0].values())[0]
 
-        INSTRUÇÕES DE RESPOSTA:
-        1. Se houver apenas 1 resultado, confirme o nome da pessoa (ex: "Encontrei as notas do Douglas...") e responda o dado principal que ele pediu.
-        2. Seja extremamente conciso. Evite listas com asteriscos se puder falar em uma frase natural.
-        3. Se o nome no banco for um pouco diferente do que o usuário digitou (ex: Dougla -> Douglas), mencione o nome correto para confirmar.
-        4. NUNCA use frases como "Encontramos registros relacionados" ou "Abaixo estão os dados".
-        5. Não repita informações técnicas como IDs ou timestamps, a menos que solicitado.
+        # SELEÇÃO DO PROMPT ADEQUADO
+        if is_single_value:
+            # PROMPT PARA DADO ÚNICO (Contagens, Totais)
+            summary_prompt = f"""
+            Atue como um assistente direto.
+            
+            CONTEXTO:
+            Usuário perguntou: "{user_msg}"
+            O Banco de Dados respondeu: {single_val}
+            
+            TAREFA:
+            Responda APENAS o número com uma frase curta de contexto.
+            
+            Exemplos BOAS respostas:
+            - "O total de alunos cadastrados hoje é 16."
+            - "Encontrei 16 registros."
+            - "A maior nota foi 98.5."
+            
+            Exemplos RUINS (NÃO FAÇA):
+            - "Encontrei 1 resultado com valor 16." (Robótico)
+            - "O banco retornou count 16." (Técnico)
+            
+            Responda agora de forma amigável:
+            """
+        else:
+            summary_prompt = f"""
+            Atue como um assistente prestativo.
+            
+            CONTEXTO:
+            Usuário perguntou: "{user_msg}"
+            Total de registros: {total}
+            Dados (Amostra): {json.dumps(data_preview, ensure_ascii=False)}
 
-        Exemplo de tom: "Encontrei a nota do Douglas Marcone. Ele está com status pendente e nota 26.0."
+            Responda ao usuário como um Relatório Executivo.
+            
+            TAREFA:
+            1. Responda em Português natural.
+            2. Se for uma lista de pessoas, use bullet points (•).
+            3. Formate datas para o padrão brasileiro (DD/MM/AAAA).
+            4. Se houver muitos dados, diga "Aqui estão os X primeiros...".
+            5. NÃO use JSON, não use chaves {{}}, nem aspas técnicas na resposta final.
+            6. Use EXCLUSIVAMENTE o símbolo de bullet "•" (caractere especial) para listar qualquer campo ou item.
+            7. NUNCA use hífens (-), asteriscos (*) ou labels puras sem bullet.
+
+            [REGRAS DE OURO - OBRIGATÓRIO]
+            1. SEJA BREVE: Máximo de 3 linhas de texto antes da lista (se houver).
+            2. ZERO JARGÃO: Nunca diga "null", "None", "string" ou "objeto". Se estiver vazio, diga "Não consta".
+            
+            E ao final de tudo, dê um toque humano, tipo "Posso ajudar em mais alguma coisa?" ou "Encontramos X resultados mas exibimos apenas 10, procura por alguem ou algo especifico?" para incentivar a continuidade da conversa.
+            """
         
-        Seja sucinto.
-        """
-        
+        # Chama a IA para formatar o texto
         final_text = call_ai_service([{"role": "user", "content": summary_prompt}], temperature=0.3)
 
         return jsonify({
             "response": final_text,
             "data": rows,
-            "meta": {"total": total, "displayed": len(data_preview)}
+            "meta": {"total": total}
         })
 
-    except psycopg2.Error as db_err:
-        logger.error(f"Erro SQL: {db_err}")
-        # Retorno amigável se a IA errar coluna
-        return jsonify({"response": "Tive uma confusão interna ao buscar os dados. Tente reformular a pergunta."})
     except Exception as e:
-        logger.error(f"Erro Geral: {e}")
-        return jsonify({"error": "Erro interno do servidor"}), 500
+        logger.error(f"Erro Geral no Chat: {e}")
+        return jsonify({"error": "Erro interno"}), 500
     finally:
         release_db_connection(conn)
+
+@app.route("/chat/reset", methods=["POST"])
+@jwt_required
+def reset_chat():
+    user_id = request.user["user_id"]
+    # Remove a chave de contexto do usuário no Redis
+    redis_client.delete(f"chat:context:{user_id}")
+    logger.info(f"🧹 Contexto do Redis resetado para o usuário {user_id} (Refresh da página)")
+    return jsonify({"status": "success", "message": "Contexto limpo"}), 200
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
