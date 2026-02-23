@@ -49,10 +49,11 @@ IA_TIMEOUT = 45
 CORS(app, resources={r"/*": {"origins": "*"}})
 
 # Configurações de Banco de Dados (Connection Pool)
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_NAME = os.getenv("DB_NAME", "pd_backoffice")
-DB_USER = os.getenv("DB_USER", "admin")
-DB_PASS = os.getenv("DB_PASS", "asdd")
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+DB_NAME = os.getenv("DB_NAME")
+DB_USER = os.getenv("DB_USER")
+DB_PASS = os.getenv("DB_PASS")
 MIN_CONN = 1
 MAX_CONN = 20
 
@@ -60,7 +61,7 @@ MAX_CONN = 20
 try:
     pg_pool = psycopg2.pool.ThreadedConnectionPool(
         MIN_CONN, MAX_CONN,
-        host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASS
+        host=DB_HOST, port=DB_PORT, database=DB_NAME, user=DB_USER, password=DB_PASS
     )
     logger.info("Connection Pool do PostgreSQL iniciado com sucesso.")
 except Exception as e:
