@@ -36,20 +36,17 @@ COPY --chown=appuser:appuser .env .
 # Copia todo o restante do código (já com o dono correto)
 COPY --chown=appuser:appuser . .
 
-# Muda para usuário não-root
 USER appuser
 
-# Expõe a porta que o Flask/Gunicorn vai usar
 EXPOSE 5000
 
-# Healthcheck simples (ajuste a rota se sua app usa outra)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:5000/ || exit 1
 
-# Comando de inicialização com gunicorn
-# Ajuste 'app:app' → nome_do_seu_arquivo:nome_da_variavel_flask
-CMD ["gunicorn", "--bind", "0.0.0.0:5000", \
+CMD ["gunicorn", \
+     "--bind", "0.0.0.0:5000", \
      "--workers", "2", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \
+     "--control-server", "none", \
      "app:app"]
