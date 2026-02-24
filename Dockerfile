@@ -48,5 +48,5 @@ CMD ["gunicorn", \
      "--workers", "2", \
      "--access-logfile", "-", \
      "--error-logfile", "-", \
-     "--control-server", "none", \
+     "--no-control-socket", \
      "app:app"]
